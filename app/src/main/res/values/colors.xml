@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Nexora Palette -->
+    <color name="nexora_bg">#F8FAFC</color>
+    <color name="nexora_surface">#FFFFFF</color>
+    <color name="nexora_border">#E2E8F0</color>
+    
+    <color name="nexora_violet">#6D28D9</color>
+    <color name="nexora_violet_light">#7C3AED</color>
+    <color name="nexora_violet_soft">#F5F3FF</color>
+    
+    <color name="nexora_text_primary">#0F172A</color>
+    <color name="nexora_text_secondary">#64748B</color>
+    <color name="nexora_text_muted">#94A3B8</color>
+    
+    <color name="nexora_live">#10B981</color>
+    <color name="nexora_warning">#F59E0B</color>
+    <color name="nexora_offline">#64748B</color>
+    <color name="nexora_danger">#EF4444</color>
+
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>

@@ -1,0 +1,11 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme for Nexora. -->
+    <style name="Base.Theme.PeerConnect" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/nexora_violet</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <item name="android:windowBackground">@color/nexora_bg</item>
+    </style>
+
+    <style name="Theme.PeerConnect" parent="Base.Theme.PeerConnect" />
+    <style name="Theme.NexorA" parent="Base.Theme.PeerConnect" />
+</resources>
