@@ -122,9 +122,7 @@ class ChatAdapter(
             textSender.text = msg.senderName
 
             itemView.setOnClickListener {
-                if (!pathOrUri.isNullOrEmpty()) {
-                    onAttachmentClick?.invoke(fileName, pathOrUri)
-                }
+                onAttachmentClick?.invoke(fileName, pathOrUri ?: "")
             }
         }
     }
@@ -165,9 +163,7 @@ class ChatAdapter(
             }
 
             itemView.setOnClickListener {
-                if (!pathOrUri.isNullOrEmpty()) {
-                    onAttachmentClick?.invoke(fileName, pathOrUri)
-                }
+                onAttachmentClick?.invoke(fileName, pathOrUri ?: "")
             }
         }
     }

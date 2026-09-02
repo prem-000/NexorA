@@ -91,13 +91,23 @@ class MainActivity : AppCompatActivity() {
     // Track active file transfers
     private val incomingFilePayloads = mutableMapOf<Long, Payload>()
 
-    // Track completed incoming files pending metadata (Order B handling)
-    private data class PendingReceivedFile(
+    // Deterministic payload tracking maps
+    private data class PendingFileMetadata(
+        val messageId: Long? = null,
+        val alertId: String? = null,
+        val fileName: String,
+        val senderName: String,
+        val endpointId: String,
+        val timestamp: Long = System.currentTimeMillis()
+    )
+    private val pendingFileMetadataMap = java.util.Collections.synchronizedMap(mutableMapOf<Long, PendingFileMetadata>())
+
+    private data class CompletedReceivedFile(
         val endpointId: String,
         val file: File,
         val timestamp: Long = System.currentTimeMillis()
     )
-    private val pendingReceivedFiles = java.util.Collections.synchronizedList(mutableListOf<PendingReceivedFile>())
+    private val pendingCompletedFilesMap = java.util.Collections.synchronizedMap(mutableMapOf<Long, CompletedReceivedFile>())
 
     // AUTO-LOOP HANDLER
     private val handler = Handler(Looper.getMainLooper())
@@ -247,6 +257,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(R.layout.activity_main)
 
         val mainHeaderCard = findViewById<View>(R.id.mainHeaderCard)
@@ -326,6 +337,68 @@ class MainActivity : AppCompatActivity() {
         editMessage = findViewById(R.id.editMessage)
         btnSend = findViewById(R.id.btnSend)
         btnAttach = findViewById(R.id.btnAttach)
+
+        val appBarCard = findViewById<View>(R.id.appBarCard)
+        if (appBarCard != null) {
+            ViewCompat.setOnApplyWindowInsetsListener(appBarCard) { view, insets ->
+                val statusBarHeight = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top
+                view.setPadding(view.paddingLeft, statusBarHeight, view.paddingRight, view.paddingBottom)
+                insets
+            }
+        }
+
+        val alertThreadAppBar = findViewById<View>(R.id.alertThreadAppBar)
+        if (alertThreadAppBar != null) {
+            ViewCompat.setOnApplyWindowInsetsListener(alertThreadAppBar) { view, insets ->
+                val statusBarHeight = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top
+                view.setPadding(view.paddingLeft, statusBarHeight, view.paddingRight, view.paddingBottom)
+                insets
+            }
+        }
+
+        if (bottomNavigation != null) {
+            ViewCompat.setOnApplyWindowInsetsListener(bottomNavigation) { view, insets ->
+                val navBarsHeight = insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
+                view.setPadding(view.paddingLeft, view.paddingTop, view.paddingRight, navBarsHeight)
+                insets
+            }
+        }
+
+        val inputCard = findViewById<View>(R.id.inputCard)
+        if (layoutChat != null && inputCard != null) {
+            ViewCompat.setOnApplyWindowInsetsListener(layoutChat) { _, insets ->
+                val imeHeight = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+                val navBarsHeight = insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
+                val bottomMargin = if (imeHeight > 0) imeHeight else navBarsHeight
+                val params = inputCard.layoutParams as android.view.ViewGroup.MarginLayoutParams
+                val baseMargin = (12 * resources.displayMetrics.density).toInt()
+                params.bottomMargin = bottomMargin + baseMargin
+                inputCard.layoutParams = params
+
+                if (imeHeight > 0 && ::chatAdapter.isInitialized && chatAdapter.itemCount > 0) {
+                    chatRecyclerView.post { chatRecyclerView.scrollToPosition(chatAdapter.itemCount - 1) }
+                }
+                insets
+            }
+        }
+
+        val alertThreadInputCard = findViewById<View>(R.id.alertThreadInputCard)
+        if (layoutAlertThread != null && alertThreadInputCard != null) {
+            ViewCompat.setOnApplyWindowInsetsListener(layoutAlertThread) { _, insets ->
+                val imeHeight = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+                val navBarsHeight = insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
+                val bottomMargin = if (imeHeight > 0) imeHeight else navBarsHeight
+                val params = alertThreadInputCard.layoutParams as android.view.ViewGroup.MarginLayoutParams
+                val baseMargin = (12 * resources.displayMetrics.density).toInt()
+                params.bottomMargin = bottomMargin + baseMargin
+                alertThreadInputCard.layoutParams = params
+
+                if (imeHeight > 0 && ::alertThreadAdapter.isInitialized && alertThreadAdapter.itemCount > 0) {
+                    alertThreadRecyclerView.post { alertThreadRecyclerView.scrollToPosition(alertThreadAdapter.itemCount - 1) }
+                }
+                insets
+            }
+        }
 
         // Adapters
         alertAdapter = AlertAdapter { alert ->
@@ -669,6 +742,7 @@ class MainActivity : AppCompatActivity() {
 
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
+            Log.d(TAG, "[PAYLOAD_RX] endpointId=$endpointId payloadId=${payload.id} type=${payload.type}")
             when (payload.type) {
                 Payload.Type.BYTES -> {
                     val receivedBytes = payload.asBytes()!!
@@ -685,7 +759,37 @@ class MainActivity : AppCompatActivity() {
                                         val rSender = parts[1]
                                         val rTitle = parts[2]
                                         val rDesc = parts[3]
-                                        val rAttach = if (parts.size > 4) parts.subList(4, parts.size).joinToString("|") else null
+                                        val rAttachRaw = if (parts.size > 4) parts.subList(4, parts.size).joinToString("|") else null
+
+                                        var finalAttachPath: String? = null
+                                        var filePayloadId: Long? = null
+
+                                        if (!rAttachRaw.isNullOrEmpty()) {
+                                            val cleanAttach = when {
+                                                rAttachRaw.startsWith("[FILE]:") -> rAttachRaw.removePrefix("[FILE]:")
+                                                rAttachRaw.startsWith("📄 Shared a file: ") -> rAttachRaw.removePrefix("📄 Shared a file: ")
+                                                rAttachRaw.startsWith("📄 Shared a file:") -> rAttachRaw.removePrefix("📄 Shared a file:")
+                                                else -> rAttachRaw
+                                            }
+                                            val attachParts = cleanAttach.split("|")
+                                            val attachFileName = attachParts[0]
+                                            val senderPath = if (attachParts.size > 1) attachParts[1] else null
+                                            filePayloadId = if (attachParts.size > 2) attachParts[2].toLongOrNull() else null
+
+                                            val completedFile = if (filePayloadId != null) pendingCompletedFilesMap.remove(filePayloadId) else null
+                                            if (completedFile != null && completedFile.file.exists()) {
+                                                val finalFile = prepareDestinationFile(completedFile.file, attachFileName)
+                                                finalAttachPath = "[FILE]:${finalFile.name}|${finalFile.absolutePath}"
+                                                emitAlert("TRANSFER", "TRANSFER COMPLETE", "${finalFile.name} received successfully")
+                                                withContext(Dispatchers.Main) {
+                                                    Toast.makeText(this@MainActivity, "File Saved!", Toast.LENGTH_LONG).show()
+                                                }
+                                            } else if (!senderPath.isNullOrEmpty() && File(senderPath).exists()) {
+                                                finalAttachPath = "[FILE]:$attachFileName|$senderPath"
+                                            } else {
+                                                finalAttachPath = "[FILE]:$attachFileName"
+                                            }
+                                        }
 
                                         val existing = db.alertDao().getAlertByAlertId(rAlertId)
                                         if (existing == null) {
@@ -696,10 +800,20 @@ class MainActivity : AppCompatActivity() {
                                                 description = rDesc,
                                                 peerName = rSender,
                                                 timestamp = msg.time,
-                                                attachmentPath = rAttach
+                                                attachmentPath = finalAttachPath
                                             )
                                             db.alertDao().insertAlert(newAlert)
                                             loadAlertsFromDb()
+
+                                            if (filePayloadId != null && (finalAttachPath == null || !finalAttachPath.contains("|/"))) {
+                                                val attachFileName = rAttachRaw?.split("|")?.firstOrNull()?.removePrefix("[FILE]:") ?: "attachment"
+                                                pendingFileMetadataMap[filePayloadId] = PendingFileMetadata(
+                                                    alertId = rAlertId,
+                                                    fileName = attachFileName,
+                                                    senderName = rSender,
+                                                    endpointId = endpointId
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -726,7 +840,8 @@ class MainActivity : AppCompatActivity() {
                                     }
                                 }
                                 else -> {
-                                    val storedBody = if (decryptedBody.startsWith("[FILE]:") || decryptedBody.startsWith("📄 Shared a file:")) {
+                                    val isFileMsg = decryptedBody.startsWith("[FILE]:") || decryptedBody.startsWith("📄 Shared a file:")
+                                    val storedBody = if (isFileMsg) {
                                         val cleanBody = when {
                                             decryptedBody.startsWith("[FILE]:") -> decryptedBody.removePrefix("[FILE]:")
                                             decryptedBody.startsWith("📄 Shared a file: ") -> decryptedBody.removePrefix("📄 Shared a file: ")
@@ -734,29 +849,15 @@ class MainActivity : AppCompatActivity() {
                                         }
                                         val parts = cleanBody.split("|")
                                         val fileName = parts[0]
+                                        val filePayloadId = if (parts.size > 2) parts[2].toLongOrNull() else null
 
-                                        // Purge expired pending files (> 5 min old)
                                         val now = System.currentTimeMillis()
-                                        synchronized(pendingReceivedFiles) {
-                                            pendingReceivedFiles.removeAll { now - it.timestamp > 300_000 }
-                                        }
+                                        pendingCompletedFilesMap.values.removeAll { now - it.timestamp > 300_000 }
+                                        pendingFileMetadataMap.values.removeAll { now - it.timestamp > 300_000 }
 
-                                        // Check if ORDER B happened (FILE payload saved before BYTES metadata arrived)
-                                        var matchedPending: PendingReceivedFile? = null
-                                        synchronized(pendingReceivedFiles) {
-                                            val iterator = pendingReceivedFiles.iterator()
-                                            while (iterator.hasNext()) {
-                                                val item = iterator.next()
-                                                if (item.endpointId == endpointId) {
-                                                    matchedPending = item
-                                                    iterator.remove()
-                                                    break
-                                                }
-                                            }
-                                        }
-
-                                        if (matchedPending != null && matchedPending!!.file.exists()) {
-                                            val finalFile = prepareDestinationFile(matchedPending!!.file, fileName)
+                                        val completedFile = if (filePayloadId != null) pendingCompletedFilesMap.remove(filePayloadId) else null
+                                        if (completedFile != null && completedFile.file.exists()) {
+                                            val finalFile = prepareDestinationFile(completedFile.file, fileName)
                                             emitAlert("TRANSFER", "TRANSFER COMPLETE", "${finalFile.name} received successfully")
                                             withContext(Dispatchers.Main) {
                                                 Toast.makeText(this@MainActivity, "File Saved!", Toast.LENGTH_LONG).show()
@@ -768,10 +869,29 @@ class MainActivity : AppCompatActivity() {
                                     } else {
                                         decryptedBody
                                     }
-                                    db.messageDao().insertMessage(MessageEntity(
+
+                                    val cleanBody = when {
+                                        decryptedBody.startsWith("[FILE]:") -> decryptedBody.removePrefix("[FILE]:")
+                                        decryptedBody.startsWith("📄 Shared a file: ") -> decryptedBody.removePrefix("📄 Shared a file: ")
+                                        else -> decryptedBody
+                                    }
+                                    val parts = cleanBody.split("|")
+                                    val filePayloadId = if (parts.size > 2) parts[2].toLongOrNull() else null
+
+                                    val insertedMsgId = db.messageDao().insertMessage(MessageEntity(
                                         senderId = msg.senderName, receiverId = myNickName,
                                         text = storedBody, timestamp = msg.time, isSent = true
                                     ))
+
+                                    if (isFileMsg && filePayloadId != null && !storedBody.contains("|/")) {
+                                        pendingFileMetadataMap[filePayloadId] = PendingFileMetadata(
+                                            messageId = insertedMsgId,
+                                            fileName = parts[0],
+                                            senderName = msg.senderName,
+                                            endpointId = endpointId
+                                        )
+                                    }
+
                                     loadRecentActivityFromDb()
                                     if (currentChatPeerName == msg.senderName) {
                                         val history = db.messageDao().getChatHistory(myNickName, msg.senderName)
@@ -789,6 +909,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
+            Log.d(TAG, "[TRANSFER_UPDATE] endpointId=$endpointId payloadId=${update.payloadId} status=${update.status} bytes=${update.bytesTransferred}/${update.totalBytes}")
             if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
                 val dbMsgId = pendingPayloads[update.payloadId]
                 if (dbMsgId != null) {
@@ -804,62 +925,79 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 }
-                val filePayload = incomingFilePayloads[update.payloadId]
+                val filePayload = incomingFilePayloads.remove(update.payloadId)
                 if (filePayload != null) {
-                    incomingFilePayloads.remove(update.payloadId)
                     lifecycleScope.launch(Dispatchers.IO) {
                         try {
-                            val allPeers = db.peerDao().getAllPeers()
-                            var targetMsg: MessageEntity? = null
-                            var targetSenderName: String? = null
-                            var targetName: String? = null
-
-                            for (peer in allPeers) {
-                                val history = db.messageDao().getChatHistory(myNickName, peer.name)
-                                val candidate = history.lastOrNull { msg ->
-                                    (msg.text.startsWith("[FILE]:") || msg.text.startsWith("📄 Shared a file:")) && !msg.text.contains("|")
-                                }
-                                if (candidate != null) {
-                                    if (targetMsg == null || candidate.timestamp > targetMsg.timestamp) {
-                                        targetMsg = candidate
-                                        targetSenderName = peer.name
-                                    }
-                                }
-                            }
-
-                            if (targetMsg != null) {
-                                val body = targetMsg.text
-                                val cleanBody = when {
-                                    body.startsWith("[FILE]:") -> body.removePrefix("[FILE]:")
-                                    body.startsWith("📄 Shared a file: ") -> body.removePrefix("📄 Shared a file: ")
-                                    else -> body
-                                }
-                                targetName = cleanBody.split("|")[0]
-                            }
-
+                            val pendingMeta = pendingFileMetadataMap.remove(update.payloadId)
+                            val targetName = pendingMeta?.fileName
                             val savedFile = saveReceivedPayloadFile(filePayload, targetName)
+
                             if (savedFile != null && savedFile.exists()) {
                                 val fileName = savedFile.name
                                 val savedPath = savedFile.absolutePath
 
-                                if (targetMsg != null) {
+                                if (pendingMeta != null) {
                                     val updatedText = "[FILE]:$fileName|$savedPath"
-                                    db.messageDao().updateMessage(targetMsg.copy(text = updatedText))
-
-                                    emitAlert("TRANSFER", "TRANSFER COMPLETE", "$fileName received successfully")
-                                    withContext(Dispatchers.Main) {
-                                        Toast.makeText(this@MainActivity, "File Saved!", Toast.LENGTH_LONG).show()
-                                        val activeChatPeer = currentChatPeerName
-                                        if (activeChatPeer != null && (activeChatPeer == targetSenderName || activeChatPeer == targetMsg?.senderId)) {
-                                            lifecycleScope.launch(Dispatchers.IO) {
-                                                val updatedHistory = db.messageDao().getChatHistory(myNickName, activeChatPeer)
-                                                withContext(Dispatchers.Main) { updateChatUI(updatedHistory) }
+                                    if (pendingMeta.messageId != null) {
+                                        val existingMsg = db.messageDao().getMessageById(pendingMeta.messageId)
+                                        if (existingMsg != null) {
+                                            db.messageDao().updateMessage(existingMsg.copy(text = updatedText))
+                                        }
+                                        emitAlert("TRANSFER", "TRANSFER COMPLETE", "$fileName received successfully")
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(this@MainActivity, "File Saved!", Toast.LENGTH_LONG).show()
+                                            val activeChatPeer = currentChatPeerName
+                                            if (activeChatPeer != null && activeChatPeer == pendingMeta.senderName) {
+                                                lifecycleScope.launch(Dispatchers.IO) {
+                                                    val updatedHistory = db.messageDao().getChatHistory(myNickName, activeChatPeer)
+                                                    withContext(Dispatchers.Main) { updateChatUI(updatedHistory) }
+                                                }
+                                            }
+                                        }
+                                    } else if (pendingMeta.alertId != null) {
+                                        val existingAlert = db.alertDao().getAlertByAlertId(pendingMeta.alertId)
+                                        if (existingAlert != null) {
+                                            db.alertDao().updateAlert(existingAlert.copy(attachmentPath = updatedText))
+                                        }
+                                        emitAlert("TRANSFER", "TRANSFER COMPLETE", "$fileName received successfully")
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(this@MainActivity, "Alert File Saved!", Toast.LENGTH_LONG).show()
+                                            loadAlertsFromDb()
+                                            if (currentAlertThreadId == pendingMeta.alertId && existingAlert != null) {
+                                                openAlertThread(existingAlert.copy(attachmentPath = updatedText))
                                             }
                                         }
                                     }
                                 } else {
-                                    // ORDER B: BYTES metadata has not arrived yet. Store saved file in pendingReceivedFiles
-                                    pendingReceivedFiles.add(PendingReceivedFile(endpointId, savedFile))
+                                    val allFileMessages = db.messageDao().getAllFileMessages()
+                                    val candidate = allFileMessages.firstOrNull { msg ->
+                                        val clean = when {
+                                            msg.text.startsWith("[FILE]:") -> msg.text.removePrefix("[FILE]:")
+                                            msg.text.startsWith("📄 Shared a file: ") -> msg.text.removePrefix("📄 Shared a file: ")
+                                            else -> msg.text
+                                        }
+                                        val parts = clean.split("|")
+                                        val hasValidLocalFile = parts.size > 1 && File(parts[1]).exists()
+                                        !hasValidLocalFile
+                                    }
+                                    if (candidate != null) {
+                                        val updatedText = "[FILE]:$fileName|$savedPath"
+                                        db.messageDao().updateMessage(candidate.copy(text = updatedText))
+                                        emitAlert("TRANSFER", "TRANSFER COMPLETE", "$fileName received successfully")
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(this@MainActivity, "File Saved!", Toast.LENGTH_LONG).show()
+                                            val activeChatPeer = currentChatPeerName
+                                            if (activeChatPeer != null && (activeChatPeer == candidate.senderId)) {
+                                                lifecycleScope.launch(Dispatchers.IO) {
+                                                    val updatedHistory = db.messageDao().getChatHistory(myNickName, activeChatPeer)
+                                                    withContext(Dispatchers.Main) { updateChatUI(updatedHistory) }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        pendingCompletedFilesMap[update.payloadId] = CompletedReceivedFile(endpointId, savedFile)
+                                    }
                                 }
                             } else {
                                 withContext(Dispatchers.Main) {
@@ -1248,6 +1386,8 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             val alertId = "ALERT_" + System.currentTimeMillis()
             var attachmentPathStr: String? = null
+            var alertFilePayload: Payload? = null
+            var alertFilePayloadId: Long? = null
 
             if (uri != null && fileName != null) {
                 val downloadsDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
@@ -1262,6 +1402,20 @@ class MainActivity : AppCompatActivity() {
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error saving alert attachment local file", e)
+                }
+
+                try {
+                    val pfd = contentResolver.openFileDescriptor(uri, "r")
+                    if (pfd != null) {
+                        val fp = Payload.fromFile(pfd)
+                        alertFilePayload = fp
+                        alertFilePayloadId = fp.id
+                        if (attachmentPathStr != null) {
+                            attachmentPathStr = "$attachmentPathStr|$alertFilePayloadId"
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error creating alert binary file payload", e)
                 }
             }
 
@@ -1288,9 +1442,21 @@ class MainActivity : AppCompatActivity() {
 
             try {
                 val payloadBytes = serialize(chatMsg)
-                for (endpointId in discoveredEndpoints.keys) {
-                    val payload = Payload.fromBytes(payloadBytes)
-                    Nearby.getConnectionsClient(this@MainActivity).sendPayload(endpointId, payload)
+                val onlinePeers = db.peerDao().getAllPeers().filter { it.isOnline && it.endpointId.isNotEmpty() }
+                Log.d(TAG, "[ALERT_TX] connectedPeerCount=${onlinePeers.size}")
+                for (peer in onlinePeers) {
+                    try {
+                        val payload = Payload.fromBytes(payloadBytes)
+                        Log.d(TAG, "[ALERT_TX] sending BYTES endpoint=${peer.endpointId} peer=${peer.name}")
+                        Nearby.getConnectionsClient(this@MainActivity).sendPayload(peer.endpointId, payload)
+
+                        if (alertFilePayload != null) {
+                            Log.d(TAG, "[ALERT_TX] sending FILE payload endpoint=${peer.endpointId} payloadId=$alertFilePayloadId")
+                            Nearby.getConnectionsClient(this@MainActivity).sendPayload(peer.endpointId, alertFilePayload)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "[ALERT_TX] Error sending to endpoint=${peer.endpointId}", e)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Broadcast alert fail", e)
@@ -1380,9 +1546,17 @@ class MainActivity : AppCompatActivity() {
 
             try {
                 val payloadBytes = serialize(chatMsg)
-                for (endpointId in discoveredEndpoints.keys) {
-                    val payload = Payload.fromBytes(payloadBytes)
-                    Nearby.getConnectionsClient(this@MainActivity).sendPayload(endpointId, payload)
+                val onlinePeers = db.peerDao().getAllPeers().filter { it.isOnline && it.endpointId.isNotEmpty() }
+                Log.d(TAG, "[ALERT_REPLY_TX] connectedPeerCount=${onlinePeers.size}")
+                for (peer in onlinePeers) {
+                    try {
+                        val payload = Payload.fromBytes(payloadBytes)
+                        Log.d(TAG, "[ALERT_REPLY_TX] sending endpoint=${peer.endpointId} peer=${peer.name}")
+                        Nearby.getConnectionsClient(this@MainActivity).sendPayload(peer.endpointId, payload)
+                        Log.d(TAG, "[ALERT_REPLY_TX] sendPayload invoked endpoint=${peer.endpointId}")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "[ALERT_REPLY_TX] Error sending to endpoint=${peer.endpointId}", e)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Broadcast alert reply fail", e)
@@ -1447,6 +1621,7 @@ class MainActivity : AppCompatActivity() {
         try {
             val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return
             val filePayload = Payload.fromFile(pfd)
+            val payloadId = filePayload.id
             Nearby.getConnectionsClient(this).sendPayload(currentChatEndpointId!!, filePayload)
 
             val downloadsDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
@@ -1461,7 +1636,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             val localPath = if (localFile.exists()) localFile.absolutePath else uri.toString()
-            val metaText = "[FILE]:$fileName|$localPath"
+            val metaText = "[FILE]:$fileName|$localPath|$payloadId"
             sendMessage(metaText)
             Toast.makeText(this, "Sending $fileName...", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
@@ -1499,6 +1674,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
+            Log.d(TAG, "[FILE_SAVE] payloadId=${filePayload.id} filename=$name destination=${destinationFile.absolutePath} exists=${destinationFile.exists()} size=${destinationFile.length()}")
             destinationFile
         } catch (e: Exception) {
             Log.e(TAG, "Error saving received payload file", e)
@@ -1539,13 +1715,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openAttachment(fileName: String, pathOrUri: String) {
+        Log.d("FILE_DEBUG", "fileName=$fileName")
+        Log.d("FILE_DEBUG", "pathOrUri=$pathOrUri")
+
+        if (pathOrUri.isEmpty()) {
+            Toast.makeText(this, "File transfer is still in progress...", Toast.LENGTH_SHORT).show()
+            return
+        }
         try {
             val uri: Uri = if (pathOrUri.startsWith("content://")) {
                 Uri.parse(pathOrUri)
             } else {
                 val file = File(pathOrUri)
-                if (!file.exists()) {
-                    Toast.makeText(this, "File not found on device", Toast.LENGTH_SHORT).show()
+                Log.d("FILE_DEBUG", "absolutePath=${file.absolutePath}")
+                Log.d("FILE_DEBUG", "exists=${file.exists()}")
+                Log.d("FILE_DEBUG", "isFile=${file.isFile}")
+                Log.d("FILE_DEBUG", "size=${file.length()}")
+
+                if (!file.exists() || file.length() == 0L) {
+                    Toast.makeText(this, "File not found on this device.", Toast.LENGTH_SHORT).show()
                     return
                 }
                 FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
@@ -1568,16 +1756,22 @@ class MainActivity : AppCompatActivity() {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
 
+            val resInfoList = packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+            for (resolveInfo in resInfoList) {
+                val pkg = resolveInfo.activityInfo.packageName
+                grantUriPermission(pkg, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
             val chooser = Intent.createChooser(intent, "Open $fileName").apply {
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
 
             startActivity(chooser)
         } catch (e: ActivityNotFoundException) {
-            Toast.makeText(this, "No app found to open $fileName", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "No application found to open $fileName", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Log.e(TAG, "Error opening attachment", e)
-            Toast.makeText(this, "Cannot open file: ${e.message}", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Unable to open this file", Toast.LENGTH_SHORT).show()
         }
     }
 

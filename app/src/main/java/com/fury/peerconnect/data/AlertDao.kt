@@ -3,11 +3,15 @@ package com.fury.peerconnect.data
 import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.Query
+import androidx.room.Update
 
 @Dao
 interface AlertDao {
     @Insert
     suspend fun insertAlert(alert: AlertEntity): Long
+
+    @Update
+    suspend fun updateAlert(alert: AlertEntity)
 
     @Query("SELECT * FROM alerts ORDER BY timestamp DESC LIMIT 100")
     suspend fun getAllAlerts(): List<AlertEntity>

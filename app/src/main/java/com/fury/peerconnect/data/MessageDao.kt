@@ -13,6 +13,9 @@ interface MessageDao {
     @Update
     suspend fun updateMessage(msg: MessageEntity)
 
+    @Query("SELECT * FROM messages WHERE id = :msgId LIMIT 1")
+    suspend fun getMessageById(msgId: Long): MessageEntity?
+
     // Get chat history between ME and ONE FRIEND
     @Query("SELECT * FROM messages WHERE (senderId = :myId AND receiverId = :friendId) OR (senderId = :friendId AND receiverId = :myId) ORDER BY timestamp ASC")
     suspend fun getChatHistory(myId: String, friendId: String): List<MessageEntity>
@@ -28,4 +31,8 @@ interface MessageDao {
     // Mark a specific message as sent
     @Query("UPDATE messages SET isSent = 1 WHERE id = :msgId")
     suspend fun markAsSent(msgId: Int)
+
+    // Get all file messages ordered by newest first
+    @Query("SELECT * FROM messages WHERE text LIKE '[FILE]:%' OR text LIKE '📄 Shared a file:%' ORDER BY timestamp DESC")
+    suspend fun getAllFileMessages(): List<MessageEntity>
 }
